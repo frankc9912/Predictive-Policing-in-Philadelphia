@@ -15,11 +15,14 @@ library(tidycensus)
 library(tigris)
 library(sf)
 library(ggplot2)
+library(measurements)
 library(scales)
 library(extrafont)
+library(colorspace)
 library(viridis)
 library(raster)
 library(spdep)
+library(spatstat)
 library(tmap)
 library(FNN)
 library(grid)
@@ -49,6 +52,21 @@ plot.theme <- function(){
         panel.grid.minor.x = element_blank(),
         panel.grid.major.y = element_line(color = "gray85"),
         panel.grid.minor.y = element_line(color = "gray95"))
+}
+
+map.theme <- function(base_size = 12, title_size = 16) {
+  theme(
+    text = element_text(color = "black"),
+    plot.title = element_text(size = title_size,color = "black"),
+    plot.subtitle=element_text(face = "italic"),
+    plot.caption=element_text(hjust = 0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text.x = element_text(size = 14))
 }
 
 nn_function <- function(measureFrom,measureTo,k) {
@@ -84,6 +102,15 @@ neigh <-
     project_path, "/philadelphia-neighborhoods.geojson"
     )) %>% 
   st_transform(crs = phl_crs)
+
+phl_boundary <- 
+  st_read(paste0(
+    project_path, "/City_Limits.geojson"
+    )) %>% 
+  dplyr::select(geometry) %>% 
+  st_transform(crs = phl_crs)
+
+st_area(phl_boundary)
   
 po_district <- 
   st_read(paste0(
@@ -96,6 +123,14 @@ po_serv_area <-
     project_path, "/Boundaries_PSA.geojson"
     )) %>% 
   st_transform(crs = phl_crs)
+
+po_station <- 
+  st_read(paste0(
+    project_path, "/Police_Stations.geojson"
+    )) %>% 
+  st_transform(crs = phl_crs) %>% 
+  dplyr::select(geometry) %>% 
+  mutate(Legend = "Police_Station")
 ```
 
 ```{r read crime data}
@@ -141,11 +176,6 @@ abd_vehicle <-
   st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
   st_transform(crs = phl_crs) %>%
   mutate(Legend = "Abandoned_Cars")
-
-vac_building <- 
-  st_read(paste0(
-    project_path, "/Vacant_Indicators_Points.geojson"
-    ))
 
 dan_building <- 
   pub_ser %>% 
@@ -193,40 +223,44 @@ dan_park <-
   mutate(Legend = "Unsafe_Parks")
 ```
 
-```{r read business license data}
-liq_retail <- 
+```{r read liquor data}
+bar <- 
   st_read(paste0(
-    project_path, "/alcohol_shop.geojson"
-    ))
+    project_path, "/bars.geojson"
+    )) %>% 
+  st_transform(crs = phl_crs) %>% 
+  dplyr::select(geometry) %>% 
+  mutate(Legend = "Bar")
 
+pubs <- 
+  st_read(paste0(
+    project_path, "/pubs.geojson"
+    )) %>% 
+  st_transform(crs = phl_crs) %>% 
+  dplyr::select(geometry) %>% 
+  mutate(Legend = "Pubs")
 
-bl <- 
+night_club <- 
+  st_read(paste0(
+    project_path, "/night_club.geojson"
+    )) %>% 
+  st_transform(crs = phl_crs) %>% 
+  dplyr::select(geometry) %>% 
+  mutate(Legend = "Night_club")
+
+onsite_liquor <- 
+  rbind(bar, pubs, night_club) %>% 
+  mutate(Legend = "Onsite_Liquor")
+  
+liquor_retail <- 
   read.csv(paste0(
-    project_path, "/business_licenses.csv"
-    ))
-
-c <- bl %>% distinct(licensetype)
-
-liq_var <- c("tavern", "Tavern", "TAVERN", "PUB", "Pub", "pub")
-liq_var_wrong <- c("publi", "PUBLI", "Publi")
-
-liq_retail <- data.frame()
-
-for (i in liq_var) {
-  liq_retail <- 
-    bl %>% 
-    filter(str_detect(business_name, i)) %>% 
-    rbind(liq_retail)
-}
-d <- liq_retail
-for (i in liq_var_wrong) {
-  d <- 
-    d %>% 
-    filter(! str_detect(business_name, i))
-}
-d <- liq_retail %>% filter(! str_detect(business_name, "public"))
-
-
+    project_path, "/liquor_retail.csv"
+  )) %>% 
+  st_as_sf(wkt = "geometry") %>% 
+  st_set_crs(4326) %>% 
+  dplyr::select(geometry) %>% 
+  st_transform(crs = phl_crs) %>% 
+  mutate(Legend = "Liquor_Retail")
 ```
 
 ```{r traffic data}
@@ -236,7 +270,679 @@ traffic_count <-
   st_read(paste0(
     project_path, "/Traffic_Count_Locations.geojson"
     )) %>% 
-  filter(setyear == "2022") %>% 
-  st_transform(crs = phl_crs)
+  filter(setyear == "2022",
+         ! is.na(aadt)) %>% 
+  st_transform(crs = phl_crs) %>% 
+  dplyr::select(Traffic_Volume = aadt, geometry)
+```
+
+## Fishnet
+
+Granularity: A 0.25 mile square provides a good balance between being granular enough to identify hotspots and large enough to be manageable in analysis.
+
+Urban Fit: It aligns well with typical urban block sizes, covering roughly 4-6 city blocks, which is a practical size for police patrols and resource allocation.
+
+Data Resolution: It allows for a detailed resolution that can capture variations in crime patterns effectively without overwhelming data analysts with too many small grids.
+
+Given Philadelphia's block length of about 400-600 feet, a 0.25 mile (1,320 feet) square unit would encompass approximately 2-3 blocks in each direction
+
+```{r makinig fishnet}
+fishnet <- 
+  st_make_grid(phl_boundary,
+               cellsize = conv_unit(250, "m", "ft"), 
+               square = TRUE) %>%
+  .[phl_boundary] %>%            # fast way to select intersecting polygons
+  st_sf() %>%
+  mutate(uniqueID = 1:n())
+
+crime_net <- 
+  dplyr::select(felony_22) %>% 
+  mutate(count_felony = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(count_felony = replace_na(count_felony, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = count_felony), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Count of felony for the fishnet") +
+  map.theme()
+```
+
+```{r var net}
+vars_net <- 
+  rbind(abd_vehicle,dan_building,graffiti,
+        sanitation, st_light_out, dan_park,
+        onsite_liquor, liquor_retail, po_station) %>%
+  st_join(., fishnet, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+    full_join(fishnet) %>%
+    spread(Legend, count, fill=0) %>%
+    st_sf() %>%
+    dplyr::select(-`<NA>`) %>%
+    na.omit() %>%
+    ungroup()
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour = NA) +
+      scale_fill_viridis(name = "") +
+      labs(title=i) +
+      map.theme()}
+
+do.call(grid.arrange,c(mapList, ncol = 3, top = "Risk Factors by Fishnet"))
+```
+
+## Feature Engineering
+
+### NN
+
+```{r create nn}
+st_c <- st_coordinates
+st_coid <- st_centroid
+
+vars_net <-
+  vars_net %>%
+    mutate(
+      abd_vehicle.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(abd_vehicle),5),
+      dan_building.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(dan_building),5),
+      graffiti.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(graffiti),5),
+      sanitation.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(sanitation),5),
+      st_light_out.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(st_light_out),5),
+      dan_park.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(dan_park),5),
+      onsite_liquor.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(onsite_liquor),1),
+      liquor_retail.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(liquor_retail),1),
+      po_station.nn = 
+        nn_function(st_c(st_coid(vars_net)), st_c(po_station),1))
+
+mean(vars_net$abd_vehicle.nn)
+mean(vars_net$dan_building.nn)
+mean(vars_net$graffiti.nn)
+mean(vars_net$sanitation.nn)
+mean(vars_net$st_light_out.nn)
+mean(vars_net$dan_park.nn)
+mean(vars_net$onsite_liquor.nn)
+mean(vars_net$liquor_retail.nn)
+mean(vars_net$po_station.nn)
+```
+
+### Centrality of Places
+
+Take Center City as the center of Philadelphia.
+
+```{r center}
+cc_point <-
+  filter(neigh, NAME == "CENTER_CITY") %>%
+  dplyr::select(NAME, geometry) %>% 
+  st_centroid()
+
+vars_net$cc_distance =
+  st_distance(st_centroid(vars_net),cc_point) %>%
+  as.numeric()
+
+ggplot() +
+  geom_sf(data=vars_net, aes(fill=cc_distance)) +
+  scale_fill_continuous_sequential(palette = "Viridis", trans = "reverse") +
+  labs(title="Euclidean Distance to Center City") +
+  map.theme() 
+```
+
+### Final Net
+
+Join neighborhood and police district information.
+
+```{r final net}
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+final_net <-
+  st_centroid(final_net) %>%
+    st_join(dplyr::select(neigh, name = NAME), by = "uniqueID") %>%
+    st_join(dplyr::select(po_district, District = DISTRICT_), by = "uniqueID") %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+      st_sf() %>%
+  na.omit()
+```
+
+### Spatial Process
+
+```{r local moran}
+## generates warnings from PROJ issues
+## {spdep} to make polygon to neighborhoods... 
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+## ... and neighborhoods to list of weigths
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+
+local_morans <- localmoran(final_net$count_felony, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Felony_Count = count_felony, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+  
+## This is just for plotting
+vars <- unique(final_net.localMorans$Variable)
+varList <- list()
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(final_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      map.theme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 4, top = "Local Morans I Statistics, Felony"))
+```
+
+```{r hot spot}
+# generates warning from NN
+final_net <- final_net %>% 
+  mutate(felony.isSig = 
+           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+  mutate(felony.isSig.dist = 
+           nn_function(st_c(st_coid(final_net)),
+                       st_c(st_coid(filter(final_net, 
+                                           felony.isSig == 1))), 
+                       k = 1))
+
+ggplot() +
+      geom_sf(data = final_net, aes(fill = felony.isSig.dist), colour = NA) +
+      scale_fill_viridis(name = "NN Distance") +
+      labs(title="Distance to Highly Significant Felony Hotspots") +
+      map.theme()
+```
+
+### Correlation Test
+
+```{r correlation}
+correlation.long <-
+  st_drop_geometry(final_net) %>%
+    dplyr::select(-uniqueID, -cvID, -cc_distance, -name, -District) %>%
+    gather(Variable, Value, -count_felony)
+
+correlation.cor <-
+  correlation.long %>%
+    group_by(Variable) %>%
+    summarize(correlation = cor(Value, count_felony, use = "complete.obs"))
+    
+ggplot(correlation.long, aes(Value, count_felony)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "orange", lwd = 0.7) +
+  facet_wrap(~Variable, ncol = 3, scales = "free") +
+  labs(title = "Felony Count as A Function of Risk Factors") +
+  plot.theme()
+```
+
+## Modeling and Cross Validation
+
+### Poison Regression
+
+```{r poison regression}
+ggplot(final_net, aes(count_felony)) + 
+  geom_histogram(binwidth = 1) +
+  geom_vline(aes(xintercept = mean(count_felony)),
+             color = "orange", size = 0.7) +
+  labs(title = "Distribution of Felony by Grid Cell") +
+  plot.theme() +
+  theme(plot.title = element_text(size = 10))
+```
+
+### Cross Validation
+
+```{r cv}
+reg.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "liquor_retail.nn", "cc_distance")
+
+reg.ss.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "liquor_retail.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
+
+reg.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "dan_park.nn","onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance")
+
+reg.ss.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "dan_park.nn","onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
+
+## RUN REGRESSIONS
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "count_felony",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = cvID, count_felony, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "count_felony",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = cvID, count_felony, Prediction, geometry)
+  
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "count_felony",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, count_felony, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "count_felony",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, count_felony, Prediction, geometry)
+
+reg.spatialCV2 <- crossValidate(
+  dataset = final_net,
+  id = "District",
+  dependentVariable = "count_felony",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = District, count_felony, Prediction, geometry)
+
+reg.ss.spatialCV2 <- crossValidate(
+  dataset = final_net,
+  id = "District",
+  dependentVariable = "count_felony",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = District, count_felony, Prediction, geometry)
+
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - count_felony,
+                             PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Random k-fold CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.cv,        Error = Prediction - count_felony,
+                             PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Random k-fold CV: Spatial Process"),
+    
+    mutate(reg.spatialCV,    Error = Prediction - count_felony,
+                             PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Spatial LOGO-CV by neighborhoods: Just Risk Factors"),
+                             
+    mutate(reg.ss.spatialCV, Error = Prediction - count_felony,
+                             PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Spatial LOGO-CV by neighborhoods: Spatial Process"),
+    
+    mutate(reg.spatialCV2, Error = Prediction - count_felony,
+                              PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Spatial LOGO-CV by police districts: Just Risk Factors"),
+    
+    mutate(reg.ss.spatialCV2, Error = Prediction - count_felony,
+                              PE = (Prediction - count_felony)/count_felony,
+                             Regression = "Spatial LOGO-CV by police districts: Spatial Process")) %>%
+    st_sf() 
+```
+
+```{r cv result}
+reg.summary <- transform(reg.summary, Regression = factor(Regression, levels=c("Random k-fold CV: Just Risk Factors", "Spatial LOGO-CV by neighborhoods: Just Risk Factors", "Spatial LOGO-CV by police districts: Just Risk Factors", "Random k-fold CV: Spatial Process", "Spatial LOGO-CV by neighborhoods: Spatial Process", "Spatial LOGO-CV by police districts: Spatial Process")))
+
+grid.arrange(
+  reg.summary %>%
+    ggplot() +
+      geom_sf(aes(fill = Prediction), color = "transparent", lwd = 0.05) +
+      geom_sf(data = phl_boundary, fill = "transparent", color = "black", lwd = 0.3) +
+      facet_wrap(~Regression) +
+      scale_fill_continuous_sequential(palette = "Reds 3", limits = c(0, 160)) +
+      labs(title = "Predicted Felony Possessions by Regression") + 
+      theme(
+    plot.title = element_text(size = 10, hjust = 0.5), 
+    plot.subtitle = element_text(size = 8), 
+    plot.caption = element_text(size = 8,hjust = 1), 
+    strip.text = element_text(size = 4), 
+    axis.title = element_text(size = 0),
+    axis.text = element_text(size = 0),
+    legend.key.width = unit(0.2, "cm"),
+    legend.title = element_text(size = 0), 
+    legend.text = element_text(size = 4), 
+    plot.margin = unit(c(0, 0, 0, 0),"cm"), 
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid = element_line(color = "grey85", size = 0.1), 
+    legend.position = "none"),
+
+  filter(reg.summary, Regression == "Random k-fold CV: Just Risk Factors") %>%
+    ggplot() +
+      geom_sf(aes(fill = count_felony), color = "transparent", lwd = 0.05) +
+      geom_sf(data = phl_boundary, fill = "transparent", color = "black", lwd = 0.5) +
+      scale_fill_continuous_sequential(palette = "Reds 3", limits = c(0, 160)) +
+      labs(title = "Felony") +
+      theme(
+    plot.title = element_text(size = 10, hjust = 0.5), 
+    plot.subtitle = element_text(size = 8), 
+    plot.caption = element_text(size = 8,hjust = 1), 
+    strip.text = element_text(size = 8), 
+    axis.title = element_text(size = 0),
+    axis.text = element_text(size = 4),
+    legend.key.width = unit(0.2, "cm"),
+    legend.title = element_text(size = 0), 
+    legend.text = element_text(size = 4), 
+    plot.margin = unit(c(0, 0, 0, 0),"cm"), 
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid = element_line(color = "grey85", size = 0.1), 
+    legend.position = "right"), ncol = 2, widths = c(1.15, 1))
+```
+
+```{r comparing errors}
+ggplot() +
+    geom_sf(data = reg.summary, aes(fill = Error), color = "black", lwd = 0.05)+
+    facet_wrap(~Regression, ncol = 3) +
+    scale_fill_continuous_diverging(palette = "Blue-Red 3", trans = "reverse") +
+    labs(title = "Predicted Felony Errors by Regression") +
+    theme(
+    plot.title = element_text(size = 10, hjust = 0.5), 
+    plot.subtitle = element_text(size = 8), 
+    plot.caption = element_text(size = 8,hjust = 1), 
+    strip.text = element_text(size = 6), 
+    axis.title = element_text(size = 0),
+    axis.text = element_text(size = 4),
+    legend.key.width = unit(0.2, "cm"),
+    legend.title = element_text(size = 0), 
+    legend.text = element_text(size = 4), 
+    plot.margin = unit(c(0, 0, 0, 0),"cm"), 
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid = element_line(color = "grey85", size = 0.1), 
+    legend.position = "right")
+```
+
+```{r error plot}
+reg.summary <- transform(reg.summary, Regression = factor(Regression, levels=c("Random k-fold CV: Just Risk Factors", "Random k-fold CV: Spatial Process", "Spatial LOGO-CV by neighborhoods: Just Risk Factors", "Spatial LOGO-CV by neighborhoods: Spatial Process", "Spatial LOGO-CV by police districts: Just Risk Factors", "Spatial LOGO-CV by police districts: Spatial Process")))
+
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(MAE = mean(abs(Error), na.rm = T),
+              SD_MAE = mean(sd(abs(Error)), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold2 <- 
+   reg.summary %>%
+    group_by(Regression, cvID) %>%
+    dplyr::filter(!is.infinite(PE)) %>% 
+    summarize(MAPE = mean(abs(PE), na.rm = T),
+              SD_MAPE = mean(sd(abs(PE)), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#f78d8d", lwd = 0.5) +
+    facet_wrap(~Regression, ncol = 2) +  
+    geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+    labs(title="Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+         x="Mean Absolute Error", y="Count") +
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5), 
+    plot.subtitle = element_text(size = 8), 
+    plot.caption = element_text(size = 8,hjust = 1), 
+    strip.text = element_text(size = 6), 
+    axis.title = element_text(size = 0),
+    axis.text = element_text(size = 6),
+    legend.key.height = unit(0.2, "cm"),
+    legend.title = element_text(size = 0), 
+    legend.text = element_text(size = 6), 
+    plot.margin = unit(c(0, 0, 0, 0),"cm"), 
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid = element_line(color = "grey85", size = 0.1), 
+    legend.position = "none")
+```
+
+```{r table}
+error_by_reg_and_fold3 <-
+  left_join(st_drop_geometry(error_by_reg_and_fold), st_drop_geometry(error_by_reg_and_fold2)) 
+
+e.summary <- error_by_reg_and_fold3 %>% 
+  group_by(Regression) %>% 
+    summarize(Mean_MAE = round(mean(MAE), 2),
+              SD_MAE = round(sd(MAE), 2))
+
+kbl(format = 'html', escape = FALSE, e.summary, caption = "Mean Absolute Errors Across Different Models") %>%
+  kable_styling(font_size = 10, full_width = F) %>%
+  gsub("font-size: initial !important;", 
+         "font-size: 10pt !important;", .)
+```
+
+
+```{r performance}
+st_set_geometry(reg.summary, NULL) %>%
+  group_by(Regression) %>%
+    mutate(felony_decile = ntile(count_felony, 10)) %>%
+  group_by(Regression, felony_decile) %>%
+    summarize(meanObserved = mean(count_felony, na.rm=T),
+              meanPrediction = mean(Prediction, na.rm=T)) %>%
+    gather(Variable, Value, -Regression, -felony_decile) %>%          
+    ggplot(aes(felony_decile, Value, shape = Variable)) + geom_path(aes(group = felony_decile), colour = "brown")  +
+      geom_point(size = 2, colour = "#f78d8d", fill = "#f78d8d")+
+      scale_shape_manual(values = c(2, 17)) +
+      facet_wrap(~Regression) + xlim(0,10) +
+      labs(title = "Predicted and Observed Narcotics Possession by Observed Narcotics Possession") +
+    theme(
+    plot.title = element_text(size = 10, hjust = 0.5), 
+    plot.subtitle = element_text(size = 8), 
+    plot.caption = element_text(size = 8,hjust = 1), 
+    strip.text = element_text(size = 6), 
+    axis.title = element_text(size = 0),
+    axis.text = element_text(size = 6),
+    legend.key.height = unit(0.2, "cm"),
+    legend.title = element_text(size = 0), 
+    legend.text = element_text(size = 6), 
+    plot.margin = unit(c(0, 0, 0, 0),"cm"), 
+    panel.background = element_rect(fill = "transparent"),
+    panel.grid = element_line(color = "grey85", size = 0.1), 
+    legend.position = "bottom")
+```
+
+## Generalizability by Race and Income Context
+
+We don't use demographic features to build the model, but the projected felony incidents show socioeconomic bias in disadvantaged neighborhoods. This reveals the selection bias of intitial crime data set.
+
+```{r get census data}
+phl_mhhinc <- 
+  get_acs(geography = "county", variables = "B19013_001", 
+          year = 2022, state = "PA", county = "Philadelphia") %>% 
+  dplyr::select(MedInc = estimate) %>% 
+  pull() %>% 
+  .[1]
+
+tracts_22 <- 
+  get_acs(geography = "tract", variables = c("B01003_001", "B01001A_001E", "B19013_001"), 
+          year = 2022, state = "PA", county = "Philadelphia", geometry = T) %>%
+  st_transform(crs = phl_crs)  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01003_001,
+         NumberWhites = B01001A_001,
+         MedInc = B19013_001) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         percentInc = MedInc / phl_mhhinc,
+         Race_Context = ifelse(percentWhite > .5, "Majority_White", "Majority_Non_White"),
+         Income_Context = case_when(
+           percentInc <= .5 ~ "Low_Income",
+           percentInc > .5 & percentInc <= 1.5 ~ "Moderate_Income",
+           percentInc > 1.5 ~ "High_Income")) %>%
+  .[neigh,]
+  
+tracts_22_map <- 
+  tracts_22 %>% 
+  dplyr::select(-TotalPop, -NumberWhites, -MedInc, -percentWhite, -percentInc) %>% 
+  st_drop_geometry() %>% 
+  gather(category, value, -GEOID) %>% 
+  left_join(tracts_22) %>% 
+  st_as_sf()
+  
+
+ggplot() + 
+  geom_sf(data = tracts_22_map, aes(fill = value)) +
+  scale_fill_discrete_sequential(palette = "Sunset") +
+  facet_wrap(~category) +
+  labs(title =  "Racial and Income Contexts in Philadelphia") +
+  map.theme() 
+```
+
+```{r race and income}
+reg.summary_race <- reg.summary %>% 
+    st_centroid() %>%
+    st_join(tracts_22) %>%
+    na.omit() %>%
+      st_drop_geometry() %>%
+      group_by(Regression, Race_Context) %>%
+      summarize(mean.Error = mean(Error, na.rm = T)) %>%
+      spread(Race_Context, mean.Error)
+
+reg.summary_inc <- reg.summary %>% 
+    st_centroid() %>%
+    st_join(tracts_22) %>%
+    na.omit() %>%
+      st_drop_geometry() %>%
+      group_by(Regression, Income_Context) %>%
+      summarize(mean.Error = mean(Error, na.rm = T)) %>%
+      spread(Income_Context, mean.Error)
+```
+
+```{r race table}
+kbl(format = 'html', escape = FALSE, reg.summary_race, caption = "Mean Error by Neighborhood Racial Context") %>%
+      kable_styling(font_size = 10, full_width = F) %>%
+      gsub("font-size: initial !important;", 
+         "font-size: 10pt !important;", .)
+```
+
+```{r income table}
+kbl(format = 'html', escape = FALSE, reg.summary_inc, caption = "Mean Error by Neighborhood Income Context") %>%
+      kable_styling(font_size = 10, full_width = F) %>%
+      gsub("font-size: initial !important;", 
+         "font-size: 10pt !important;", .)
+```
+
+## Comparison with Kernel Density
+
+```{r kernel density}
+felony_ppp <- as.ppp(st_coordinates(felony_23), W = st_bbox(final_net))
+felony_KD.1000 <- spatstat.explore::density.ppp(felony_ppp, 1500)
+
+felony_KDE_sum <- as.data.frame(felony_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean)
+
+kde_breaks <- classIntervals(felony_KDE_sum$value, 
+                             n = 10, "fisher")
+
+felony_KDE_sf <- felony_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = ntile(value, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
+           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
+           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
+           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
+           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
+           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
+           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
+           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
+           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(felony_23) %>% mutate(felonyCount = 1), ., sum) %>%
+    mutate(felonyCount = replace_na(felonyCount, 0))) %>%
+  dplyr::select(label, Risk_Category, felonyCount)
+
+
+felony_risk_sf <-
+  filter(reg.summary, Regression == "Random k-fold CV: Spatial Process") %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category = ntile(Prediction, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
+           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
+           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
+           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
+           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
+           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
+           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
+           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
+           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(felony_23) %>% mutate(felonyCount = 1), ., sum) %>%
+      mutate(felonyCount = replace_na(felonyCount, 0))) %>%
+  dplyr::select(label,Risk_Category, felonyCount)
+
+felony_actual_sf <- felony_23 %>% 
+  dplyr::select() %>% 
+  mutate(felonyCount23 = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(felonyCount23 = replace_na(felonyCount23, 0),
+         label = "Actual Value",
+         Risk_Category = ntile(felonyCount23, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
+           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
+           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
+           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
+           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
+           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
+           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
+           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
+           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>% 
+  mutate(felonyCount = felonyCount23,
+         geometry = geometry)
+felony_actual_sf <- felony_actual_sf[, -c(1, 2)]
+  
+
+rbind(felony_KDE_sf, felony_risk_sf, felony_actual_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(felony_23, 3000), size = .3, colour = "black") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2022 Felony risk predictions; 2023 Felony") +
+    map.theme()
+```
+
+```{r kde comparison table}
+rbind(felony_KDE_sf, felony_risk_sf, felony_actual_sf) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countFelony = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countFelony / sum(countFelony)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE, name = "Model") +
+      labs(title = "Risk prediction vs. Kernel density, 2023 Felony",
+           y = "% of Test Set Felony (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
 ```
 
