@@ -2,11 +2,22 @@
 title: "Predictive Policing in Philadelphia"
 author: "Frank Chen"
 date: "2024-07-03"
-output: html_document
+output:
+  html_document:
+    code_folding: "hide"
+    toc: yes
+    toc_float: yes
+    theme : "flatly"
+    highlight : "tango"
+    number_sections : yes
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
 ```
 
 ```{r load packages}
@@ -69,26 +80,8 @@ map.theme <- function(base_size = 12, title_size = 16) {
     strip.text.x = element_text(size = 14))
 }
 
-nn_function <- function(measureFrom,measureTo,k) {
-  measureFrom_Matrix <-
-    as.matrix(measureFrom)
-  measureTo_Matrix <-
-    as.matrix(measureTo)
-  nn <-   
-    get.knnx(measureTo, measureFrom, k)$nn.dist
-  output <-
-    as.data.frame(nn) %>%
-    rownames_to_column(var = "thisPoint") %>%
-    gather(points, point_distance, V1:ncol(.)) %>%
-    arrange(as.numeric(thisPoint)) %>%
-    group_by(thisPoint) %>%
-    summarize(pointDistance = mean(point_distance)) %>%
-    arrange(as.numeric(thisPoint)) %>% 
-    dplyr::select(-thisPoint) %>%
-    pull()
-  
-  return(output)  
-}
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
 ```
 
 ## Introduction
@@ -96,7 +89,7 @@ nn_function <- function(measureFrom,measureTo,k) {
 
 ## The Current Conditions of Narcotics Possession in Philadelphia
 
-```{r read geo data}
+```{r read geo data, results='hide'}
 neigh <- 
   st_read(paste0(
     project_path, "/philadelphia-neighborhoods.geojson"
@@ -133,7 +126,7 @@ po_station <-
   mutate(Legend = "Police_Station")
 ```
 
-```{r read crime data}
+```{r read crime data, results='hide'}
 crime_22 <- 
   read.csv(paste0(
     project_path, "/crime_incidents_2022.csv"
@@ -143,6 +136,12 @@ crime_23 <-
   read.csv(paste0(
     project_path, "/crime_incidents_2023.csv"
     ))
+
+group_by(crime_22, text_general_code) %>%
+  summarize(count = n()) %>%
+  arrange(-count) %>% 
+  kable() %>%
+  kable_styling()
 
 felony_22 <- 
   crime_22 %>% 
@@ -161,9 +160,25 @@ felony_23 <-
   st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
   st_transform(crs = phl_crs) %>%
   mutate(Legend = "felony")
+
+ggplot() +
+  geom_sf(data = phl_boundary, fill = "#440154") +
+  geom_sf(data = felony_22, color="#fde725", size = 0.7) +
+  labs(title= "Felony, Philadelphia - 2022") +
+  map.theme()
+
+ggplot() +
+  stat_density2d(data = data.frame(st_coordinates(felony_22)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  geom_sf(data = phl_boundary, color = "black", fill = "transparent", lwd = 0.5) +
+  scale_fill_continuous_sequential(palette = rev("Viridis")) +
+  scale_alpha(range = c(0, 0.35), guide = FALSE) +
+  labs(title = "Density of Narcotics Possession") +
+  map.theme()
 ```
 
-```{r 311 data}
+```{r 311 data, results='hide'}
 pub_ser <- read.csv(paste0(
     project_path, "/public_cases_311.csv"
     ))
@@ -223,7 +238,7 @@ dan_park <-
   mutate(Legend = "Unsafe_Parks")
 ```
 
-```{r read liquor data}
+```{r read liquor data, results='hide'}
 bar <- 
   st_read(paste0(
     project_path, "/bars.geojson"
@@ -263,7 +278,7 @@ liquor_retail <-
   mutate(Legend = "Liquor_Retail")
 ```
 
-```{r traffic data}
+```{r traffic data, results='hide'}
 # https://www.dvrpc.org/traffic/
 # Annual Average Daily Traffic (aadt)
 traffic_count <- 
@@ -301,7 +316,7 @@ crime_net <-
   aggregate(., fishnet, sum) %>%
   mutate(count_felony = replace_na(count_felony, 0),
          uniqueID = 1:n(),
-         cvID = sample(round(nrow(fishnet) / 24), 
+         cvID = sample(round(nrow(fishnet) / 60), 
                        size=nrow(fishnet), replace = TRUE))
 
 ggplot() +
@@ -309,13 +324,16 @@ ggplot() +
   scale_fill_viridis() +
   labs(title = "Count of felony for the fishnet") +
   map.theme()
+
+ggplot() +
+  geom_sf(data = fishnet, color = "#440154") +
+  map.theme()
 ```
 
 ```{r var net}
 vars_net <- 
   rbind(abd_vehicle,dan_building,graffiti,
-        sanitation, st_light_out, dan_park,
-        onsite_liquor, liquor_retail, po_station) %>%
+        sanitation, st_light_out, liquor_retail, po_station) %>%
   st_join(., fishnet, join = st_within) %>%
   st_drop_geometry() %>%
   group_by(uniqueID, Legend) %>%
@@ -341,14 +359,14 @@ for(i in vars){
       labs(title=i) +
       map.theme()}
 
-do.call(grid.arrange,c(mapList, ncol = 3, top = "Risk Factors by Fishnet"))
+do.call(grid.arrange,c(mapList, ncol = 4, top = "Risk Factors by Fishnet"))
 ```
 
 ## Feature Engineering
 
 ### NN
 
-```{r create nn}
+```{r create nn, results='hide'}
 st_c <- st_coordinates
 st_coid <- st_centroid
 
@@ -365,25 +383,42 @@ vars_net <-
         nn_function(st_c(st_coid(vars_net)), st_c(sanitation),5),
       st_light_out.nn =
         nn_function(st_c(st_coid(vars_net)), st_c(st_light_out),5),
-      dan_park.nn =
-        nn_function(st_c(st_coid(vars_net)), st_c(dan_park),5),
-      onsite_liquor.nn =
-        nn_function(st_c(st_coid(vars_net)), st_c(onsite_liquor),1),
       liquor_retail.nn =
         nn_function(st_c(st_coid(vars_net)), st_c(liquor_retail),1),
       po_station.nn = 
         nn_function(st_c(st_coid(vars_net)), st_c(po_station),1))
 
-mean(vars_net$abd_vehicle.nn)
-mean(vars_net$dan_building.nn)
-mean(vars_net$graffiti.nn)
-mean(vars_net$sanitation.nn)
-mean(vars_net$st_light_out.nn)
-mean(vars_net$dan_park.nn)
-mean(vars_net$onsite_liquor.nn)
-mean(vars_net$liquor_retail.nn)
-mean(vars_net$po_station.nn)
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID) %>% 
+  filter(Variable %in% c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn", "liquor_retail.nn", "po_station.nn", "cc_distance"))
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour = NA) +
+      scale_fill_viridis(name = "") +
+      labs(title=i) +
+      map.theme()}
+
+do.call(grid.arrange,c(mapList, ncol = 4, top = "Risk Factors by Fishnet"))
 ```
+
+```{r traffic count}
+traffic_count <- traffic_count %>% 
+  st_join(fishnet) %>% 
+  filter(! is.na(uniqueID)) %>% 
+  st_drop_geometry() %>% 
+  group_by(uniqueID) %>% 
+  summarise(Traffic_Volume = mean(Traffic_Volume))
+
+vars_net <- vars_net %>% 
+  left_join(., traffic_count, by = "uniqueID") %>% 
+  mutate(Traffic_Volume = ifelse(is.na(Traffic_Volume), 0, Traffic_Volume))
+```
+
 
 ### Centrality of Places
 
@@ -410,7 +445,7 @@ ggplot() +
 
 Join neighborhood and police district information.
 
-```{r final net}
+```{r final net, results='hide'}
 final_net <-
   left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
 
@@ -442,7 +477,7 @@ final_net.localMorans <-
   dplyr::select(Felony_Count = count_felony, 
                 Local_Morans_I = Ii, 
                 P_Value = `Pr(z != E(Ii))`) %>%
-  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.0001, 1, 0)) %>%
   gather(Variable, Value, -geometry)
   
 ## This is just for plotting
@@ -465,7 +500,7 @@ do.call(grid.arrange,c(varList, ncol = 4, top = "Local Morans I Statistics, Felo
 # generates warning from NN
 final_net <- final_net %>% 
   mutate(felony.isSig = 
-           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+           ifelse(local_morans[,5] <= 0.0001, 1, 0)) %>%
   mutate(felony.isSig.dist = 
            nn_function(st_c(st_coid(final_net)),
                        st_c(st_coid(filter(final_net, 
@@ -485,10 +520,12 @@ ggplot() +
 correlation.long <-
   st_drop_geometry(final_net) %>%
     dplyr::select(-uniqueID, -cvID, -cc_distance, -name, -District) %>%
-    gather(Variable, Value, -count_felony)
+    gather(Variable, Value, -count_felony) %>% 
+  filter(Variable != "Traffic_Volume")
 
 correlation.cor <-
   correlation.long %>%
+  filter(Variable != "Traffic_Volume") %>% 
     group_by(Variable) %>%
     summarize(correlation = cor(Value, count_felony, use = "complete.obs"))
     
@@ -497,7 +534,7 @@ ggplot(correlation.long, aes(Value, count_felony)) +
   geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
             x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
   geom_smooth(method = "lm", se = FALSE, colour = "orange", lwd = 0.7) +
-  facet_wrap(~Variable, ncol = 3, scales = "free") +
+  facet_wrap(~Variable, ncol = 4, scales = "free") +
   labs(title = "Felony Count as A Function of Risk Factors") +
   plot.theme()
 ```
@@ -518,14 +555,14 @@ ggplot(final_net, aes(count_felony)) +
 
 ### Cross Validation
 
-```{r cv}
-reg.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "liquor_retail.nn", "cc_distance")
+```{r cv, results='hide'}
+reg.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn", "liquor_retail.nn", "po_station.nn", "cc_distance")
 
-reg.ss.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "liquor_retail.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
+reg.ss.vars <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn", "liquor_retail.nn", "po_station.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
 
-reg.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "dan_park.nn","onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance")
+reg.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn", "dan_park.nn", "onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance")
 
-reg.ss.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn",  "dan_park.nn","onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
+reg.ss.vars1 <- c("abd_vehicle.nn", "dan_building.nn", "graffiti.nn", "sanitation.nn", "st_light_out.nn", "dan_park.nn", "onsite_liquor.nn", "liquor_retail.nn", "po_station.nn", "cc_distance", "felony.isSig", "felony.isSig.dist")
 
 ## RUN REGRESSIONS
 reg.cv <- crossValidate(
@@ -605,13 +642,12 @@ grid.arrange(
   reg.summary %>%
     ggplot() +
       geom_sf(aes(fill = Prediction), color = "transparent", lwd = 0.05) +
-      geom_sf(data = phl_boundary, fill = "transparent", color = "black", lwd = 0.3) +
       facet_wrap(~Regression) +
-      scale_fill_continuous_sequential(palette = "Reds 3", limits = c(0, 160)) +
+      scale_fill_continuous_sequential(palette = "Viridis", rev = F) +
       labs(title = "Predicted Felony Possessions by Regression") + 
       theme(
     plot.title = element_text(size = 10, hjust = 0.5), 
-    plot.subtitle = element_text(size = 8), 
+    plot.subtitle = element_text(size = 12), 
     plot.caption = element_text(size = 8,hjust = 1), 
     strip.text = element_text(size = 4), 
     axis.title = element_text(size = 0),
@@ -627,12 +663,11 @@ grid.arrange(
   filter(reg.summary, Regression == "Random k-fold CV: Just Risk Factors") %>%
     ggplot() +
       geom_sf(aes(fill = count_felony), color = "transparent", lwd = 0.05) +
-      geom_sf(data = phl_boundary, fill = "transparent", color = "black", lwd = 0.5) +
-      scale_fill_continuous_sequential(palette = "Reds 3", limits = c(0, 160)) +
+      scale_fill_continuous_sequential(palette = "Viridis", rev = F) +
       labs(title = "Felony") +
       theme(
     plot.title = element_text(size = 10, hjust = 0.5), 
-    plot.subtitle = element_text(size = 8), 
+    plot.subtitle = element_text(size = 12), 
     plot.caption = element_text(size = 8,hjust = 1), 
     strip.text = element_text(size = 8), 
     axis.title = element_text(size = 0),
@@ -648,7 +683,7 @@ grid.arrange(
 
 ```{r comparing errors}
 ggplot() +
-    geom_sf(data = reg.summary, aes(fill = Error), color = "black", lwd = 0.05)+
+    geom_sf(data = reg.summary, aes(fill = Error), color = NA)+
     facet_wrap(~Regression, ncol = 3) +
     scale_fill_continuous_diverging(palette = "Blue-Red 3", trans = "reverse") +
     labs(title = "Predicted Felony Errors by Regression") +
@@ -784,9 +819,17 @@ tracts_22 <-
            percentInc > 1.5 ~ "High_Income")) %>%
   .[neigh,]
   
-tracts_22_map <- 
+tracts_22_race <- 
   tracts_22 %>% 
-  dplyr::select(-TotalPop, -NumberWhites, -MedInc, -percentWhite, -percentInc) %>% 
+  dplyr::select(-TotalPop, -NumberWhites, -MedInc, -percentWhite, -percentInc, -Income_Context) %>% 
+  st_drop_geometry() %>% 
+  gather(category, value, -GEOID) %>% 
+  left_join(tracts_22) %>% 
+  st_as_sf()
+
+tracts_22_inc <- 
+  tracts_22 %>% 
+  dplyr::select(-TotalPop, -NumberWhites, -MedInc, -percentWhite, -percentInc, -Race_Context) %>% 
   st_drop_geometry() %>% 
   gather(category, value, -GEOID) %>% 
   left_join(tracts_22) %>% 
@@ -794,14 +837,19 @@ tracts_22_map <-
   
 
 ggplot() + 
-  geom_sf(data = tracts_22_map, aes(fill = value)) +
+  geom_sf(data = tracts_22_race, aes(fill = value)) +
   scale_fill_discrete_sequential(palette = "Sunset") +
-  facet_wrap(~category) +
-  labs(title =  "Racial and Income Contexts in Philadelphia") +
+  labs(title =  "Racial Contexts in Philadelphia") +
+  map.theme() 
+
+ggplot() + 
+  geom_sf(data = tracts_22_inc, aes(fill = value)) +
+  scale_fill_discrete_sequential(palette = "Purple-Yellow") +
+  labs(title =  "Income Contexts in Philadelphia") +
   map.theme() 
 ```
 
-```{r race and income}
+```{r race and income, results='hide'}
 reg.summary_race <- reg.summary %>% 
     st_centroid() %>%
     st_join(tracts_22) %>%
@@ -838,30 +886,41 @@ kbl(format = 'html', escape = FALSE, reg.summary_inc, caption = "Mean Error by N
 ## Comparison with Kernel Density
 
 ```{r kernel density}
-felony_ppp <- as.ppp(st_coordinates(felony_23), W = st_bbox(final_net))
-felony_KD.1000 <- spatstat.explore::density.ppp(felony_ppp, 1500)
+felony_ppp <- as.ppp(st_coordinates(felony_22), W = st_bbox(final_net))
+felony_KD.1000 <- spatstat.explore::density.ppp(felony_ppp, conv_unit(500, "m", "ft"))
+felony_KD.1500 <- spatstat.explore::density.ppp(felony_ppp, conv_unit(750, "m", "ft"))
+felony_KD.2000 <- spatstat.explore::density.ppp(felony_ppp, conv_unit(1000, "m", "ft"))
 
-felony_KDE_sum <- as.data.frame(felony_KD.1000) %>%
+felony_KD.df <- rbind(
+  mutate(data.frame(rasterToPoints(mask(raster(felony_KD.1000), as(neigh, 'Spatial')))), Legend = "500 m"),
+  mutate(data.frame(rasterToPoints(mask(raster(felony_KD.1500), as(neigh, 'Spatial')))), Legend = "750 m"),
+  mutate(data.frame(rasterToPoints(mask(raster(felony_KD.2000), as(neigh, 'Spatial')))), Legend = "1000 m")) 
+felony_KD.df$Legend <- factor(felony_KD.df$Legend, levels = c("500 m", "750 m", "1000 m"))
+
+ggplot(data = felony_KD.df, aes(x=x, y=y)) +
+  geom_raster(aes(fill=layer)) + 
+  facet_wrap(~Legend) +
+  coord_sf(crs=st_crs(final_net)) + 
+  scale_fill_viridis(name="Density") +
+  labs(title = "Kernel density with 3 different search radii") +
+  map.theme()
+
+felony_KDE_sum <- as.data.frame(felony_KD.1500) %>%
   st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
   aggregate(., final_net, mean)
 
 kde_breaks <- classIntervals(felony_KDE_sum$value, 
-                             n = 10, "fisher")
+                             n = 5, "fisher")
 
 felony_KDE_sf <- felony_KDE_sum %>%
   mutate(label = "Kernel Density",
          Risk_Category = ntile(value, 100),
          Risk_Category = case_when(
-           Risk_Category >= 90 ~ "90% to 100%",
-           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
-           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
-           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
-           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
-           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
-           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
-           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
-           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
-           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>%
+           Risk_Category >= 80 ~ "80% to 100%",
+           Risk_Category >= 60 & Risk_Category < 80 ~ "60% to 79%",
+           Risk_Category >= 40 & Risk_Category < 60 ~ "40% to 59%",
+           Risk_Category >= 20 & Risk_Category < 40 ~ "20% to 39%",
+           Risk_Category >= 1 & Risk_Category < 20 ~ "1% to 19%")) %>%
   cbind(
     aggregate(
       dplyr::select(felony_23) %>% mutate(felonyCount = 1), ., sum) %>%
@@ -874,16 +933,11 @@ felony_risk_sf <-
   mutate(label = "Risk Predictions",
          Risk_Category = ntile(Prediction, 100),
          Risk_Category = case_when(
-           Risk_Category >= 90 ~ "90% to 100%",
-           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
-           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
-           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
-           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
-           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
-           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
-           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
-           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
-           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>%
+           Risk_Category >= 80 ~ "80% to 100%",
+           Risk_Category >= 60 & Risk_Category < 80 ~ "60% to 79%",
+           Risk_Category >= 40 & Risk_Category < 60 ~ "40% to 59%",
+           Risk_Category >= 20 & Risk_Category < 40 ~ "20% to 39%",
+           Risk_Category >= 1 & Risk_Category < 20 ~ "1% to 19%")) %>%
   cbind(
     aggregate(
       dplyr::select(felony_23) %>% mutate(felonyCount = 1), ., sum) %>%
@@ -896,18 +950,13 @@ felony_actual_sf <- felony_23 %>%
   aggregate(., fishnet, sum) %>%
   mutate(felonyCount23 = replace_na(felonyCount23, 0),
          label = "Actual Value",
-         Risk_Category = ntile(felonyCount23, 100),
+         Risk_Category = ifelse(felonyCount23 != 0, ntile(felonyCount23, 100), 1),
          Risk_Category = case_when(
-           Risk_Category >= 90 ~ "90% to 100%",
-           Risk_Category >= 80 & Risk_Category <= 89 ~ "80% to 89%",
-           Risk_Category >= 70 & Risk_Category <= 79 ~ "70% to 79%",
-           Risk_Category >= 60 & Risk_Category <= 69 ~ "60% to 69%",
-           Risk_Category >= 50 & Risk_Category <= 59 ~ "50% to 59%",
-           Risk_Category >= 40 & Risk_Category <= 49 ~ "40% to 49%",
-           Risk_Category >= 30 & Risk_Category <= 39 ~ "30% to 39%",
-           Risk_Category >= 20 & Risk_Category <= 29 ~ "20% to 29%",
-           Risk_Category >= 10 & Risk_Category <= 19 ~ "10% to 19%",
-           Risk_Category >= 1 & Risk_Category <= 9 ~ "1% to 9%")) %>% 
+           Risk_Category >= 80 ~ "80% to 100%",
+           Risk_Category >= 60 & Risk_Category < 80 ~ "60% to 79%",
+           Risk_Category >= 40 & Risk_Category < 60 ~ "40% to 59%",
+           Risk_Category >= 20 & Risk_Category < 40 ~ "20% to 39%",
+           Risk_Category >= 1 & Risk_Category < 20 ~ "1% to 19%")) %>% 
   mutate(felonyCount = felonyCount23,
          geometry = geometry)
 felony_actual_sf <- felony_actual_sf[, -c(1, 2)]
